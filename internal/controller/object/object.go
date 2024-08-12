@@ -63,6 +63,7 @@ import (
 	apisv1alpha1 "github.com/crossplane-contrib/provider-kubernetes/apis/v1alpha1"
 	"github.com/crossplane-contrib/provider-kubernetes/internal/features"
 	kubeclient "github.com/crossplane-contrib/provider-kubernetes/pkg/kube/client"
+	"github.com/crossplane-contrib/provider-kubernetes/pkg/kube/client/ssa"
 )
 
 type key int
@@ -178,6 +179,8 @@ func Setup(mgr ctrl.Manager, o controller.Options, sanitizeSecrets bool, pollJit
 		kube:            mgr.GetClient(),
 		usage:           resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
 		clientBuilder:   kubeclient.NewIdentityAwareBuilder(mgr.GetClient()),
+
+		stateCacheManager: ssa.NewDesiredStateCacheStore(ssa.WithCacheStoreLogger(l)),
 	}
 
 	if o.Features.Enabled(features.EnableAlphaServerSideApply) {
@@ -246,6 +249,8 @@ type connector struct {
 	ssaEnabled      bool
 
 	clientBuilder kubeclient.Builder
+
+	stateCacheManager ssa.StateCacheManager
 }
 
 func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) {
@@ -297,8 +302,9 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 			return nil, errors.Wrap(err, errCreateSSAExtractor)
 		}
 		e.syncer = &SSAResourceSyncer{
-			client:    k,
-			extractor: applyExtractor,
+			client:            k,
+			extractor:         applyExtractor,
+			desiredStateCache: c.stateCacheManager.LoadOrNewForManaged(mg),
 		}
 	}
 
@@ -315,6 +321,8 @@ type external struct {
 	kindObserver KindObserver
 
 	sanitizeSecrets bool
+
+	desiredStateCacheManager ssa.StateCacheManager
 }
 
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) { // nolint:gocyclo, mostly branches due to feature flags, hopefully will be refactored once they are promoted
@@ -348,6 +356,8 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}, current)
 
 	if kerrors.IsNotFound(err) {
+		// remove cache entry
+		c.desiredStateCacheManager.Remove(mg)
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
