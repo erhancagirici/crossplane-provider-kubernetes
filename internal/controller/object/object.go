@@ -37,8 +37,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
-	applymetav1 "k8s.io/client-go/applyconfigurations/meta/v1"
-	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -63,6 +61,7 @@ import (
 	apisv1alpha1 "github.com/crossplane-contrib/provider-kubernetes/apis/v1alpha1"
 	"github.com/crossplane-contrib/provider-kubernetes/internal/features"
 	kubeclient "github.com/crossplane-contrib/provider-kubernetes/pkg/kube/client"
+	"github.com/crossplane-contrib/provider-kubernetes/pkg/kube/client/ssa"
 )
 
 type key int
@@ -177,11 +176,12 @@ func Setup(mgr ctrl.Manager, o controller.Options, sanitizeSecrets bool, pollJit
 		sanitizeSecrets: sanitizeSecrets,
 		kube:            mgr.GetClient(),
 		usage:           resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
-		clientBuilder:   kubeclient.NewIdentityAwareBuilder(mgr.GetClient()),
+		clientBuilder:   kubeclient.NewCachingIdentityAwareBuilder(mgr.GetClient()),
 	}
 
 	if o.Features.Enabled(features.EnableAlphaServerSideApply) {
 		conn.ssaEnabled = true
+		conn.extractorCache = ssa.NewExtractorCache(ssa.WithCacheLogger(o.Logger.WithValues("component", "apply-configuration-extractor-cache")))
 	}
 
 	cb := ctrl.NewControllerManagedBy(mgr).
@@ -245,7 +245,8 @@ type connector struct {
 	kindObserver    KindObserver
 	ssaEnabled      bool
 
-	clientBuilder kubeclient.Builder
+	clientBuilder  kubeclient.CachingBuilder
+	extractorCache *ssa.ExtractorCache
 }
 
 func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) {
@@ -263,7 +264,7 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, errors.Wrap(err, errGetProviderConfig)
 	}
 
-	k, rc, err := c.clientBuilder.KubeForProviderConfig(ctx, pc.Spec)
+	k, rc, specHash, err := c.clientBuilder.KubeForProviderConfigWithCacheKey(ctx, pc.Spec)
 	if err != nil {
 		return nil, errors.Wrap(err, errBuildKubeForProviderConfig)
 	}
@@ -288,13 +289,9 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}
 
 	if c.ssaEnabled {
-		dc, err := discovery.NewDiscoveryClientForConfig(rc)
+		applyExtractor, err := c.extractorCache.RetrieveApplyExtractor(pc, specHash, rc)
 		if err != nil {
-			return nil, errors.Wrap(err, errCreateDiscoveryClient)
-		}
-		applyExtractor, err := applymetav1.NewUnstructuredExtractor(dc)
-		if err != nil {
-			return nil, errors.Wrap(err, errCreateSSAExtractor)
+			return nil, err
 		}
 		e.syncer = &SSAResourceSyncer{
 			client:    k,

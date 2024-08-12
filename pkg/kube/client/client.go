@@ -15,6 +15,9 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -48,6 +51,11 @@ const (
 // config.
 type Builder interface {
 	KubeForProviderConfig(ctx context.Context, pc kconfig.ProviderConfigSpec) (client.Client, *rest.Config, error)
+}
+
+type CachingBuilder interface {
+	Builder
+	KubeForProviderConfigWithCacheKey(ctx context.Context, pc kconfig.ProviderConfigSpec) (client.Client, *rest.Config, string, error)
 }
 
 // BuilderFn is a function that can be used as a Builder.
@@ -214,4 +222,139 @@ func fromAPIConfig(c *api.Config) (*rest.Config, error) {
 	config.QPS = 50
 
 	return config, nil
+}
+
+type CachingIdentityAwareBuilder struct {
+	local client.Client
+	store *token.ReuseSourceStore
+}
+
+// NewCachingIdentityAwareBuilder returns a new CachingIdentityAwareBuilder.
+func NewCachingIdentityAwareBuilder(local client.Client) *CachingIdentityAwareBuilder {
+	return &CachingIdentityAwareBuilder{local: local, store: token.NewReuseSourceStore()}
+}
+
+func (c *CachingIdentityAwareBuilder) KubeForProviderConfig(ctx context.Context, pc kconfig.ProviderConfigSpec) (client.Client, *rest.Config, error) {
+	k, rc, _, err := c.KubeForProviderConfigWithCacheKey(ctx, pc)
+	return k, rc, err
+}
+
+func (c *CachingIdentityAwareBuilder) KubeForProviderConfigWithCacheKey(ctx context.Context, pc kconfig.ProviderConfigSpec) (client.Client, *rest.Config, string, error) {
+	rc, cacheKey, err := c.restForProviderConfig(ctx, pc)
+	if err != nil {
+		return nil, nil, "", errors.Wrapf(err, "cannot get REST config for provider")
+	}
+	k, err := client.New(rc, client.Options{})
+	if err != nil {
+		return nil, nil, "", errors.Wrapf(err, "cannot create Kubernetes client for provider")
+	}
+	return k, rc, cacheKey, nil
+}
+
+func (c *CachingIdentityAwareBuilder) restForProviderConfig(ctx context.Context, pc kconfig.ProviderConfigSpec) (*rest.Config, string, error) { // nolint:gocyclo
+	var rc *rest.Config
+	var err error
+
+	var credSum string
+	var identitySum string
+
+	switch cd := pc.Credentials; cd.Source { //nolint:exhaustive
+	case xpv1.CredentialsSourceInjectedIdentity:
+		rc, err = rest.InClusterConfig()
+		if err != nil {
+			return nil, "", errors.Wrap(err, errCreateRestConfig)
+		}
+		// TODO(erhan): proper sum for incluster config
+		// TODO(erhan): does not react to CAFile content changes
+		credSum = hashString(fmt.Sprintf("%s:%s:%s:%s", rc.Host, rc.BearerToken, rc.BearerTokenFile, rc.TLSClientConfig.CAFile))
+	default:
+		kc, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.local, cd.CommonCredentialSelectors)
+		if err != nil {
+			return nil, "", errors.Wrap(err, errGetCreds)
+		}
+		ac, err := clientcmd.Load(kc)
+		if err != nil {
+			return nil, "", errors.Wrap(err, "failed to load kubeconfig")
+		}
+
+		if rc, err = fromAPIConfig(ac); err != nil {
+			return nil, "", errors.Wrap(err, errCreateRestConfig)
+		}
+		credSum = hashBytes(kc)
+	}
+
+	if id := pc.Identity; id != nil {
+		switch id.Type {
+		case kconfig.IdentityTypeGoogleApplicationCredentials:
+			switch id.Source { //nolint:exhaustive
+			case xpv1.CredentialsSourceInjectedIdentity:
+				if err := gke.WrapRESTConfig(ctx, rc, nil, gke.DefaultScopes...); err != nil {
+					return nil, "", errors.Wrap(err, errInjectGoogleCredentials)
+				}
+				// TODO(erhan): detect changes in
+				identitySum = "InjectedIdentity"
+			default:
+				creds, err := resource.CommonCredentialExtractor(ctx, id.Source, c.local, id.CommonCredentialSelectors)
+				if err != nil {
+					return nil, "", errors.Wrap(err, errExtractGoogleCredentials)
+				}
+
+				if err := gke.WrapRESTConfig(ctx, rc, creds, gke.DefaultScopes...); err != nil {
+					return nil, "", errors.Wrap(err, errInjectGoogleCredentials)
+				}
+				identitySum = hashBytes(creds)
+			}
+		case kconfig.IdentityTypeAzureServicePrincipalCredentials, kconfig.IdentityTypeAzureWorkloadIdentityCredentials:
+			switch id.Source { //nolint:exhaustive
+			case xpv1.CredentialsSourceInjectedIdentity:
+				return nil, "", errors.Errorf("%s is not supported as identity source for identity type %s",
+					xpv1.CredentialsSourceInjectedIdentity, kconfig.IdentityTypeAzureServicePrincipalCredentials)
+			default:
+				creds, err := resource.CommonCredentialExtractor(ctx, id.Source, c.local, id.CommonCredentialSelectors)
+				if err != nil {
+					return nil, "", errors.Wrap(err, errExtractAzureCredentials)
+				}
+
+				if err := azure.WrapRESTConfig(ctx, rc, creds, id.Type); err != nil {
+					return nil, "", errors.Wrap(err, errInjectAzureCredentials)
+				}
+				identitySum = hashBytes(creds)
+			}
+		case kconfig.IdentityTypeUpboundTokens:
+			switch id.Source { //nolint:exhaustive
+			case xpv1.CredentialsSourceInjectedIdentity:
+				return nil, "", errors.Errorf("%s is not supported as identity source for identity type %s",
+					xpv1.CredentialsSourceInjectedIdentity, kconfig.IdentityTypeUpboundTokens)
+			default:
+				staticToken, err := resource.CommonCredentialExtractor(ctx, id.Source, c.local, id.CommonCredentialSelectors)
+				if err != nil {
+					return nil, "", errors.Wrap(err, errExtractUpboundCredentials)
+				}
+
+				// We trim the token to remove any leading/trailing whitespace
+				// which may have been added especially when stringData field
+				// is used while creating the secret.
+				if err := upbound.WrapRESTConfig(ctx, rc, strings.TrimSpace(string(staticToken)), c.store); err != nil {
+					return nil, "", errors.Wrap(err, errInjectUpboundCredentials)
+				}
+				identitySum = hashBytes(staticToken)
+			}
+		default:
+			return nil, "", errors.Errorf("unknown identity type: %s", id.Type)
+		}
+	}
+
+	return rc, fmt.Sprintf("%s%s", credSum, identitySum), nil
+}
+
+func hashBytes(kc []byte) string {
+	h := sha256.New()
+	h.Write(kc)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func hashString(s string) string {
+	h := sha256.New()
+	h.Write([]byte(s))
+	return hex.EncodeToString(h.Sum(nil))
 }
