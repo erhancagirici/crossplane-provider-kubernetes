@@ -179,12 +179,11 @@ func Setup(mgr ctrl.Manager, o controller.Options, sanitizeSecrets bool, pollJit
 		kube:            mgr.GetClient(),
 		usage:           resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
 		clientBuilder:   kubeclient.NewIdentityAwareBuilder(mgr.GetClient()),
-
-		stateCacheManager: ssa.NewDesiredStateCacheManager(),
 	}
 
 	if o.Features.Enabled(features.EnableAlphaServerSideApply) {
 		conn.ssaEnabled = true
+		conn.stateCacheManager = ssa.NewDesiredStateCacheManager()
 	}
 
 	cb := ctrl.NewControllerManagedBy(mgr).
@@ -306,6 +305,8 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 			extractor:         applyExtractor,
 			desiredStateCache: c.stateCacheManager.LoadOrNewForManaged(mg),
 		}
+		// for cache entry clean-up at delete
+		e.desiredStateCacheManager = c.stateCacheManager
 	}
 
 	return e, nil
@@ -322,6 +323,7 @@ type external struct {
 
 	sanitizeSecrets bool
 
+	// for removing desired state cache for MR at deletion
 	desiredStateCacheManager ssa.StateCacheManager
 }
 
@@ -356,8 +358,6 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}, current)
 
 	if kerrors.IsNotFound(err) {
-		// remove cache entry
-		c.desiredStateCacheManager.Remove(mg)
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 
@@ -441,6 +441,10 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 		return err
 	}
 
+	// SSA is enabled
+	if c.desiredStateCacheManager != nil {
+		c.desiredStateCacheManager.Remove(mg)
+	}
 	return errors.Wrap(resource.IgnoreNotFound(c.client.Delete(ctx, res)), errDeleteObject)
 }
 
