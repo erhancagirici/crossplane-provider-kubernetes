@@ -63,6 +63,7 @@ import (
 	apisv1alpha1 "github.com/crossplane-contrib/provider-kubernetes/apis/v1alpha1"
 	"github.com/crossplane-contrib/provider-kubernetes/internal/features"
 	kubeclient "github.com/crossplane-contrib/provider-kubernetes/pkg/kube/client"
+	"github.com/crossplane-contrib/provider-kubernetes/pkg/kube/client/ssa"
 )
 
 type key int
@@ -182,6 +183,7 @@ func Setup(mgr ctrl.Manager, o controller.Options, sanitizeSecrets bool, pollJit
 
 	if o.Features.Enabled(features.EnableAlphaServerSideApply) {
 		conn.ssaEnabled = true
+		conn.stateCacheManager = ssa.NewDesiredStateCacheManager()
 	}
 
 	cb := ctrl.NewControllerManagedBy(mgr).
@@ -246,6 +248,8 @@ type connector struct {
 	ssaEnabled      bool
 
 	clientBuilder kubeclient.Builder
+
+	stateCacheManager ssa.StateCacheManager
 }
 
 func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) {
@@ -297,8 +301,12 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 			return nil, errors.Wrap(err, errCreateSSAExtractor)
 		}
 		e.syncer = &SSAResourceSyncer{
-			client:    k,
-			extractor: applyExtractor,
+			client:            k,
+			extractor:         applyExtractor,
+			desiredStateCache: c.stateCacheManager.LoadOrNewForManaged(mg),
+		}
+		e.desiredStateCacheCleanupFn = func() {
+			c.stateCacheManager.Remove(mg)
 		}
 	}
 
@@ -315,6 +323,10 @@ type external struct {
 	kindObserver KindObserver
 
 	sanitizeSecrets bool
+
+	// for cleaning-up the desired state cache of MR from
+	// state cache manager, when MR gets deleted
+	desiredStateCacheCleanupFn func()
 }
 
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) { // nolint:gocyclo, mostly branches due to feature flags, hopefully will be refactored once they are promoted
@@ -431,6 +443,10 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 		return err
 	}
 
+	// SSA is enabled
+	if c.desiredStateCacheCleanupFn != nil {
+		c.desiredStateCacheCleanupFn()
+	}
 	return errors.Wrap(resource.IgnoreNotFound(c.client.Delete(ctx, res)), errDeleteObject)
 }
 
